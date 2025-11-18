@@ -1,31 +1,24 @@
 /*
-Single-file Qt 5.12 demo GitHub client.
+Single-file Qt 5.12 demo GitHub client (WITHOUT GitHub CLI).
+This version replaces all `gh` CLI usage with direct HTTPS REST calls to the GitHub API.
 Features:
- - Search GitHub repositories for a username (uses `gh repo list <user> --json name,sshUrl`)
+ - Search GitHub repositories for a username via GitHub REST API v3
  - Clone repositories (git clone)
  - Check for remote updates (git fetch + git status parsing)
  - Pull latest (git pull)
  - Detect changed files (git status --porcelain)
  - Show file diffs (git diff)
  - Commit & push local changes (git add -A, git commit -m, git push)
- - Simple UI with repo list, file list and diff/log viewer
 
-Requirements (for demo):
- - Qt 5.12 (Widgets module)
- - `git` available on PATH
- - `gh` (GitHub CLI) available on PATH and authenticated (optional, required for repo search)
+NOTE:
+ - To avoid rate-limits, you should provide a GitHub personal access token.
+ - The simplest path: set an environment variable `GITHUB_TOKEN` before launching.
+ - For Qt 5.12, we use QtNetwork/QNetworkAccessManager.
 
 Build (example using qmake):
- 1) Create simple .pro file:
-    QT += widgets
-    CONFIG += c++11
-    SOURCES += main.cpp
-
- 2) qmake && make
-
-Run and interact with the UI.
-
-Note: This is a demo. It purposefully keeps error handling simple so you can read the flow. Use at your own risk; the push path will commit and push to the repo you choose.
+  QT += widgets network
+  CONFIG += c++11
+  SOURCES += main.cpp
 */
 
 #include <QApplication>
@@ -47,38 +40,32 @@ Note: This is a demo. It purposefully keeps error handling simple so you can rea
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDateTime>
-#include <QFileInfo>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QTimer>
 
-// Utility helper: run a command and capture output (async-friendly sync call with timeout)
 static bool runCommand(const QString &program, const QStringList &args, QString &stdoutOut, QString &stderrOut, int timeoutMs = 120000)
 {
     QProcess proc;
     proc.start(program, args);
-    if (!proc.waitForStarted(10000)) {
-        stderrOut = "Failed to start process";
-        return false;
-    }
-    if (!proc.waitForFinished(timeoutMs)) {
-        proc.kill();
-        proc.waitForFinished(3000);
-        stderrOut = "Process timed out";
-        return false;
-    }
-    stdoutOut = QString::fromLocal8Bit(proc.readAllStandardOutput());
-    stderrOut = QString::fromLocal8Bit(proc.readAllStandardError());
+    if (!proc.waitForStarted(10000)) { stderrOut = "Failed to start"; return false; }
+    if (!proc.waitForFinished(timeoutMs)) { proc.kill(); stderrOut = "Timeout"; return false; }
+    stdoutOut = proc.readAllStandardOutput();
+    stderrOut = proc.readAllStandardError();
     return proc.exitCode() == 0;
 }
 
 class GitHubClient : public QWidget {
     Q_OBJECT
 public:
-    GitHubClient(QWidget *parent = nullptr) : QWidget(parent)
+    GitHubClient(QWidget *parent=nullptr) : QWidget(parent), net(new QNetworkAccessManager(this))
     {
         setupUi();
         connectSignals();
-        appendLog("Qt GitHub Client demo started.");
-        appendLog("Requirements: `git` and `gh` (GitHub CLI) on PATH. Authenticate gh using `gh auth login` if you want to search your repos.");
+        appendLog("Qt GitHub Client demo (REST API version) started.");
+        token = qgetenv("GITHUB_TOKEN");
+        if(token.isEmpty()) appendLog("WARNING: No GITHUB_TOKEN set — GitHub API rate limit will be LOW.");
     }
 
 private:
@@ -97,74 +84,67 @@ private:
     QPlainTextEdit *diffView;
     QPlainTextEdit *logView;
 
-    QString localBaseDir; // where clones will go
+    QString localBaseDir;
+    QString token;
+    QNetworkAccessManager *net;
 
     void setupUi()
     {
-        auto *mainLayout = new QVBoxLayout(this);
-
-        auto *topRow = new QHBoxLayout();
+        auto *main = new QVBoxLayout(this);
+        auto *top = new QHBoxLayout();
         usernameEdit = new QLineEdit();
-        usernameEdit->setPlaceholderText("GitHub username or org (e.g. octocat)");
+        usernameEdit->setPlaceholderText("GitHub username");
         searchBtn = new QPushButton("Search Repos");
         chooseDirBtn = new QPushButton("Set Clone Dir");
         cloneBtn = new QPushButton("Clone Selected");
-        topRow->addWidget(new QLabel("User:"));
-        topRow->addWidget(usernameEdit);
-        topRow->addWidget(searchBtn);
-        topRow->addWidget(chooseDirBtn);
-        topRow->addWidget(cloneBtn);
-        mainLayout->addLayout(topRow);
+        top->addWidget(new QLabel("User:"));
+        top->addWidget(usernameEdit);
+        top->addWidget(searchBtn);
+        top->addWidget(chooseDirBtn);
+        top->addWidget(cloneBtn);
+        main->addLayout(top);
 
         auto *split = new QSplitter(Qt::Horizontal);
 
-        auto *leftPanel = new QWidget();
-        auto *leftLayout = new QVBoxLayout(leftPanel);
+        auto *left = new QWidget();
+        auto *ll = new QVBoxLayout(left);
         repoList = new QListWidget();
-        leftLayout->addWidget(new QLabel("Repositories"));
-        leftLayout->addWidget(repoList);
+        ll->addWidget(new QLabel("Repositories"));
+        ll->addWidget(repoList);
+        refreshLocalBtn = new QPushButton("Refresh Local");
+        checkUpdatesBtn = new QPushButton("Check Updates");
+        pullBtn = new QPushButton("Pull");
+        ll->addWidget(refreshLocalBtn);
+        ll->addWidget(checkUpdatesBtn);
+        ll->addWidget(pullBtn);
+        split->addWidget(left);
 
-        refreshLocalBtn = new QPushButton("Refresh Local State");
-        checkUpdatesBtn = new QPushButton("Check Remote Updates");
-        pullBtn = new QPushButton("Pull Selected");
-        leftLayout->addWidget(refreshLocalBtn);
-        leftLayout->addWidget(checkUpdatesBtn);
-        leftLayout->addWidget(pullBtn);
-
-        split->addWidget(leftPanel);
-
-        auto *middlePanel = new QWidget();
-        auto *middleLayout = new QVBoxLayout(middlePanel);
+        auto *mid = new QWidget();
+        auto *ml = new QVBoxLayout(mid);
         fileList = new QListWidget();
-        middleLayout->addWidget(new QLabel("Files / Working Tree"));
-        middleLayout->addWidget(fileList);
-        diffBtn = new QPushButton("Show Diff for Selected File");
-        middleLayout->addWidget(diffBtn);
-        split->addWidget(middlePanel);
+        ml->addWidget(new QLabel("Files"));
+        ml->addWidget(fileList);
+        diffBtn = new QPushButton("Show Diff");
+        ml->addWidget(diffBtn);
+        split->addWidget(mid);
 
-        auto *rightPanel = new QWidget();
-        auto *rightLayout = new QVBoxLayout(rightPanel);
-        diffView = new QPlainTextEdit();
-        diffView->setReadOnly(true);
-        rightLayout->addWidget(new QLabel("Diff / Output"));
-        rightLayout->addWidget(diffView);
-        pushBtn = new QPushButton("Commit & Push If Changed");
-        rightLayout->addWidget(pushBtn);
-        split->addWidget(rightPanel);
+        auto *right = new QWidget();
+        auto *rl = new QVBoxLayout(right);
+        diffView = new QPlainTextEdit(); diffView->setReadOnly(true);
+        rl->addWidget(new QLabel("Diff"));
+        rl->addWidget(diffView);
+        pushBtn = new QPushButton("Commit & Push");
+        rl->addWidget(pushBtn);
+        split->addWidget(right);
 
-        split->setSizes({200, 200, 400});
+        main->addWidget(split);
 
-        mainLayout->addWidget(split, 1);
+        logView = new QPlainTextEdit(); logView->setReadOnly(true);
+        main->addWidget(new QLabel("Log"));
+        main->addWidget(logView);
 
-        logView = new QPlainTextEdit();
-        logView->setReadOnly(true);
-        logView->setMaximumHeight(180);
-        mainLayout->addWidget(new QLabel("Log"));
-        mainLayout->addWidget(logView);
-
-        // sensible defaults
         localBaseDir = QDir::homePath() + "/qt-gh-clones";
-        appendLog(QString("Default clone dir: %1").arg(localBaseDir));
+        appendLog("Default clone directory: " + localBaseDir);
     }
 
     void connectSignals()
@@ -180,323 +160,183 @@ private:
         connect(pushBtn, &QPushButton::clicked, this, &GitHubClient::onPushIfChanged);
     }
 
-    void appendLog(const QString &text)
+    void appendLog(const QString &t)
     {
-        QString stamp = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
-        logView->appendPlainText(QString("[%1] %2").arg(stamp, text));
+        logView->appendPlainText("["+QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss")+"] " + t);
     }
 
 private slots:
+
+    //=========================== API REQUEST ================================
     void onSearchRepos()
     {
         QString user = usernameEdit->text().trimmed();
-        if (user.isEmpty()) {
-            QMessageBox::warning(this, "Input required", "Please enter a GitHub username or organization.");
-            return;
-        }
-        appendLog(QString("Searching repos for %1 using gh CLI...").arg(user));
+        if(user.isEmpty()){ QMessageBox::warning(this,"Input","Username required"); return; }
+        appendLog("Searching repos via GitHub REST API...");
 
-        // Use gh repo list <user> --limit 200 --json name,sshUrl
-        QString out, err;
-        bool ok = runCommand("gh", {"repo", "list", user, "--limit", "200", "--json", "name,sshUrl"}, out, err, 120000);
-        if (!ok) {
-            appendLog(QString("gh failed: %1").arg(err));
-            QMessageBox::warning(this, "gh failed", "Failed to list repos via gh. Ensure gh is installed and authenticated. Error: " + err);
+        QUrl url(QString("https://api.github.com/users/%1/repos?per_page=100").arg(user));
+        QNetworkRequest req(url);
+        req.setHeader(QNetworkRequest::UserAgentHeader, "QtGitHubClient");
+        if(!token.isEmpty()) req.setRawHeader("Authorization", "token " + token.toUtf8());
+
+        QNetworkReply *r = net->get(req);
+        connect(r, &QNetworkReply::finished, this, [this, r](){ handleRepoListReply(r); });
+    }
+
+    void handleRepoListReply(QNetworkReply *r)
+    {
+        QByteArray data = r->readAll();
+        if(r->error()!=QNetworkReply::NoError){
+            appendLog("API error: " + r->errorString());
+            QMessageBox::warning(this,"API error",r->errorString());
+            r->deleteLater();
             return;
         }
-        // Parse JSON
-        QJsonParseError parseErr;
-        QJsonDocument doc = QJsonDocument::fromJson(out.toUtf8(), &parseErr);
-        if (parseErr.error != QJsonParseError::NoError) {
-            appendLog(QString("Failed to parse gh JSON: %1 -- falling back to plain output").arg(parseErr.errorString()));
-            // fallback: gh repo list <user> gives text lines like 'name\tSSH\n'
-            repoList->clear();
-            for (const QString &line : out.split('\n', QString::SkipEmptyParts)) {
-                repoList->addItem(line.trimmed());
-            }
+        r->deleteLater();
+
+        QJsonDocument doc = QJsonDocument::fromJson(data);
+        if(!doc.isArray()){
+            appendLog("Unexpected API JSON");
             return;
         }
         repoList->clear();
-        if (!doc.isArray()) {
-            appendLog("Unexpected gh json (not array)");
-            return;
-        }
-        QJsonArray arr = doc.array();
-        for (const QJsonValue &val : arr) {
-            if (!val.isObject()) continue;
-            QJsonObject o = val.toObject();
-            QString name = o["name"].toString();
-            QString ssh = o["sshUrl"].toString();
+        for(const QJsonValue &v : doc.array()){
+            QJsonObject o = v.toObject();
+            QString name = o.value("name").toString();
+            QString ssh  = o.value("ssh_url").toString();
             QListWidgetItem *it = new QListWidgetItem(name);
             it->setData(Qt::UserRole, ssh);
             repoList->addItem(it);
         }
-        appendLog(QString("Found %1 repositories.").arg(arr.size()));
+        appendLog(QString("Loaded %1 repos.").arg(repoList->count()));
     }
 
+    //=========================== LOCAL OPERATIONS ===========================
     void onChooseDir()
     {
-        QString dir = QFileDialog::getExistingDirectory(this, "Select base directory for clones", localBaseDir);
-        if (!dir.isEmpty()) {
-            localBaseDir = dir;
-            appendLog(QString("Set clone base dir: %1").arg(localBaseDir));
-        }
+        QString d = QFileDialog::getExistingDirectory(this,"Choose Clone Directory",localBaseDir);
+        if(!d.isEmpty()){ localBaseDir = d; appendLog("Clone dir set: "+d); }
     }
 
     void onCloneSelected()
     {
-        QList<QListWidgetItem*> items = repoList->selectedItems();
-        if (items.isEmpty()) {
-            QMessageBox::information(this, "Select a repo", "Please select a repository to clone.");
-            return;
-        }
-        for (QListWidgetItem *it : items) {
+        auto sel = repoList->selectedItems();
+        if(sel.isEmpty()){ QMessageBox::information(this,"Select","Select a repo"); return; }
+        for(QListWidgetItem *it : sel){
             QString name = it->text();
-            QString ssh = it->data(Qt::UserRole).toString();
-            if (ssh.isEmpty()) {
-                appendLog(QString("No ssh url for %1, skipping").arg(name));
-                continue;
-            }
+            QString ssh  = it->data(Qt::UserRole).toString();
+            if(ssh.isEmpty()){ appendLog("No SSH URL for "+name); continue; }
             QString target = QDir(localBaseDir).filePath(name);
-            if (QDir(target).exists()) {
-                appendLog(QString("Target %1 already exists, skipping clone").arg(target));
-                continue;
-            }
-            appendLog(QString("Cloning %1 -> %2").arg(ssh, target));
+            if(QDir(target).exists()){ appendLog("Already exists: "+target); continue; }
+            appendLog("Cloning "+ssh);
             QString out, err;
-            bool ok = runCommand("git", {"clone", ssh, target}, out, err, 0); // no timeout
-            appendLog(out);
-            if (!ok) {
-                appendLog(QString("Clone failed: %1").arg(err));
-                QMessageBox::warning(this, "Clone failed", QString("Clone failed: %1").arg(err));
-            } else {
-                appendLog("Clone succeeded.");
-            }
+            bool ok = runCommand("git", {"clone", ssh, target}, out, err, 0);
+            appendLog(out + "y" + err);
+            if(!ok) QMessageBox::warning(this,"Clone failed",err);
         }
-        // refresh file list for currently selected repo
         onRefreshLocal();
     }
 
-    void onRepoSelected(const QString &text)
-    {
-        Q_UNUSED(text);
-        onRefreshLocal();
-    }
+    void onRepoSelected(){ onRefreshLocal(); }
 
     void onRefreshLocal()
     {
         fileList->clear();
-        QListWidgetItem *it = repoList->currentItem();
-        if (!it) return;
-        QString name = it->text();
-        QString localPath = QDir(localBaseDir).filePath(name);
-        if (!QDir(localPath).exists()) {
-            appendLog(QString("Local repo not found: %1").arg(localPath));
-            return;
-        }
-        // list changed files: git status --porcelain
+        QListWidgetItem *it = repoList->currentItem(); if(!it) return;
+        QString name = it->text(); QString path = QDir(localBaseDir).filePath(name);
+        if(!QDir(path).exists()){ appendLog("Local missing: "+path); return; }
+
         QString out, err;
-        bool ok = runCommand("git", {"-C", localPath, "status", "--porcelain"}, out, err, 20000);
-        if (!ok) appendLog(QString("git status failed: %1").arg(err));
-        QStringList lines = out.split('\n', QString::SkipEmptyParts);
-        if (lines.isEmpty()) {
-            fileList->addItem("Working tree clean");
-        } else {
-            for (const QString &ln : lines) fileList->addItem(ln);
-        }
-        // show tracked files (quick): git ls-files (first 200)
-        QString lsOut, lsErr;
-        bool ok2 = runCommand("git", {"-C", localPath, "ls-files", "--modified", "--others", "--exclude-standard"}, lsOut, lsErr, 20000);
-        if (!ok2) {
-            appendLog(QString("git ls-files failed: %1").arg(lsErr));
-        } else {
-            // add a separator and show a few files
-            fileList->addItem("--- Working tree files (modified/others) ---");
-            QStringList files = lsOut.split('\n', QString::SkipEmptyParts);
-            int show = qMin(200, files.size());
-            for (int i=0;i<show;i++) fileList->addItem(files.at(i));
-            if (files.size() > show) fileList->addItem(QString("... (%1 more) ...").arg(files.size()-show));
-        }
-        appendLog("Refreshed local working tree view.");
+        runCommand("git", {"-C", path, "status", "--porcelain"}, out, err, 20000);
+        QStringList lines = out.split("",QString::SkipEmptyParts);
+        if(lines.isEmpty()) fileList->addItem("Working tree clean");
+        else for(auto &l: lines) fileList->addItem(l);
+
+        appendLog("Refreshed local state.");
     }
 
     void onCheckUpdates()
     {
-        QListWidgetItem *it = repoList->currentItem();
-        if (!it) {
-            QMessageBox::information(this, "Select repo", "Select a repository first.");
-            return;
-        }
-        QString name = it->text();
-        QString localPath = QDir(localBaseDir).filePath(name);
-        if (!QDir(localPath).exists()) {
-            QMessageBox::warning(this, "Local repo missing", "Repository not cloned locally: " + localPath);
-            return;
-        }
-        appendLog(QString("Checking for remote updates for %1").arg(name));
+        QListWidgetItem *it = repoList->currentItem(); if(!it){ QMessageBox::information(this,"Select","Select repo"); return; }
+        QString name = it->text(); QString p = QDir(localBaseDir).filePath(name);
+        appendLog("Fetching remote...");
+
         QString out, err;
-        // fetch remote
-        bool ok = runCommand("git", {"-C", localPath, "fetch"}, out, err, 60000);
-        appendLog(out);
-        if (!ok) appendLog(QString("git fetch failed: %1").arg(err));
+        runCommand("git", {"-C", p, "fetch"}, out, err, 60000);
+        appendLog(out+err);
 
-        // get current branch
-        QString branchOut, branchErr;
-        bool okb = runCommand("git", {"-C", localPath, "rev-parse", "--abbrev-ref", "HEAD"}, branchOut, branchErr, 10000);
-        QString branch = okb ? branchOut.trimmed() : "master";
+        QString brOut, brErr;
+        runCommand("git", {"-C", p, "rev-parse", "--abbrev-ref", "HEAD"}, brOut, brErr);
+        QString branch = brOut.trimmed();
 
-        // check behind/ahead count
         QString cntOut, cntErr;
-        bool okc = runCommand("git", {"-C", localPath, "rev-list", "--left-right", "--count", QString::fromUtf8("origin/%1...HEAD").arg(branch)}, cntOut, cntErr, 10000);
-        if (okc) {
-            // output like "<behind> <ahead>"
-            QStringList parts = cntOut.split('\t', QString::SkipEmptyParts);
-            if (parts.isEmpty()) parts = cntOut.split(' ', QString::SkipEmptyParts);
-            if (parts.size() >= 2) {
-                QString behind = parts.at(0).trimmed();
-                QString ahead = parts.at(1).trimmed();
-                appendLog(QString("Branch %1 is behind origin/%1 by %2 commits, ahead by %3 commits.").arg(branch, behind, ahead));
-                QMessageBox::information(this, "Remote check", QString("Branch %1: behind %2, ahead %3").arg(branch, behind, ahead));
-            } else {
-                appendLog(QString("rev-list output unexpected: %1").arg(cntOut));
-            }
-        } else {
-            appendLog(QString("rev-list failed, falling back to status parsing: %1").arg(cntErr));
-            QString statusOut, statusErr;
-            runCommand("git", {"-C", localPath, "status", "-uno"}, statusOut, statusErr, 10000);
-            appendLog(statusOut);
-            QMessageBox::information(this, "Remote check", statusOut);
-        }
+        bool ok = runCommand("git", {"-C", p, "rev-list", "--left-right", "--count", QString("origin/%1...HEAD").arg(branch)}, cntOut, cntErr);
+        if(ok){
+            QStringList parts = cntOut.split(QRegExp("[	 ]"),QString::SkipEmptyParts);
+            if(parts.size()>=2)
+                QMessageBox::information(this,"Remote",QString("Behind: %1 Ahead: %2").arg(parts[0],parts[1]));
+        } else QMessageBox::information(this,"Remote",out+err);
     }
 
     void onPullSelected()
     {
-        QListWidgetItem *it = repoList->currentItem();
-        if (!it) {
-            QMessageBox::information(this, "Select repo", "Select a repository first.");
-            return;
-        }
-        QString name = it->text();
-        QString localPath = QDir(localBaseDir).filePath(name);
-        if (!QDir(localPath).exists()) {
-            QMessageBox::warning(this, "Local repo missing", "Repository not cloned locally: " + localPath);
-            return;
-        }
-        appendLog(QString("Pulling %1").arg(name));
+        QListWidgetItem *it = repoList->currentItem(); if(!it) return;
+        QString name = it->text(); QString p = QDir(localBaseDir).filePath(name);
+        appendLog("Pulling...");
         QString out, err;
-        bool ok = runCommand("git", {"-C", localPath, "pull"}, out, err, 120000);
-        appendLog(out);
-        if (!ok) appendLog(QString("git pull failed: %1").arg(err));
-        QMessageBox::information(this, "Pull finished", out + "\n" + err);
+        runCommand("git", {"-C", p, "pull"}, out, err, 120000);
+        appendLog(out+err);
+        QMessageBox::information(this,"Pull",out+err);
         onRefreshLocal();
     }
 
     void onShowDiff()
     {
-        QListWidgetItem *repoIt = repoList->currentItem();
-        QListWidgetItem *fileIt = fileList->currentItem();
-        if (!repoIt || !fileIt) {
-            QMessageBox::information(this, "Select items", "Select a repository and a file (or changed entry) to show diff.");
-            return;
-        }
-        QString repoName = repoIt->text();
-        QString localPath = QDir(localBaseDir).filePath(repoName);
-        QString fileEntry = fileIt->text();
-        // If fileEntry is status line like ' M path/to/file' or '?? path', extract path
+        QListWidgetItem *repo = repoList->currentItem();
+        QListWidgetItem *file = fileList->currentItem();
+        if(!repo || !file){ QMessageBox::information(this,"Select","Select file"); return; }
+        QString name = repo->text(); QString p = QDir(localBaseDir).filePath(name);
+        QString entry = file->text();
+
         QString path;
-        // try to detect 'name\t' or 'XY path'
-        if (fileEntry.contains('\t')) {
-            path = fileEntry.section('\t', 1);
-        } else if (fileEntry.startsWith("---")) {
-            appendLog("Cannot show diff for separator entry.");
-            return;
-        } else {
-            // if starts with status code two chars then space
-            if (fileEntry.size() > 3 && (fileEntry[0].isSpace() || fileEntry[1].isSpace())) {
-                path = fileEntry.mid(3).trimmed();
-            } else {
-                path = fileEntry.trimmed();
-            }
-        }
-        if (path.isEmpty()) path = fileEntry.trimmed();
-        appendLog(QString("Showing diff for %1:%2").arg(repoName, path));
+        if(entry.contains("	")) path = entry.section("	",1);
+        else if(entry.size()>3) path = entry.mid(3).trimmed();
+        if(path.isEmpty()) path=entry;
+
         QString out, err;
-        bool ok = runCommand("git", {"-C", localPath, "diff", "--", path}, out, err, 20000);
-        if (!ok) appendLog(QString("git diff failed: %1").arg(err));
-        diffView->setPlainText(out + "\n" + err);
+        runCommand("git", {"-C", p, "diff", "--", path}, out, err, 20000);
+        diffView->setPlainText(out+err);
     }
 
     void onPushIfChanged()
     {
-        QListWidgetItem *it = repoList->currentItem();
-        if (!it) {
-            QMessageBox::information(this, "Select repo", "Select a repository first.");
-            return;
-        }
-        QString name = it->text();
-        QString localPath = QDir(localBaseDir).filePath(name);
-        if (!QDir(localPath).exists()) {
-            QMessageBox::warning(this, "Local repo missing", "Repository not cloned locally: " + localPath);
-            return;
-        }
-        appendLog(QString("Checking for local changes in %1").arg(name));
-        QString statusOut, statusErr;
-        runCommand("git", {"-C", localPath, "status", "--porcelain"}, statusOut, statusErr, 10000);
-        if (statusOut.trimmed().isEmpty()) {
-            appendLog("No changes to commit.");
-            QMessageBox::information(this, "No changes", "Working tree clean — nothing to commit.");
-            return;
-        }
-        // Offer commit message
-        bool ok;
-        QString msg = QInputDialog::getText(this, "Commit message", "Commit message:", QLineEdit::Normal, "Auto update from Qt GitHub client", &ok);
-        if (!ok) return;
+        QListWidgetItem *it = repoList->currentItem(); if(!it) return;
+        QString name = it->text(); QString p = QDir(localBaseDir).filePath(name);
+        QString out, err;
+        runCommand("git", {"-C", p, "status", "--porcelain"}, out, err);
+        if(out.trimmed().isEmpty()){ QMessageBox::information(this,"Clean","Nothing to push"); return; }
 
-        appendLog("Adding all changes...");
-        QString outAdd, errAdd;
-        bool okAdd = runCommand("git", {"-C", localPath, "add", "-A"}, outAdd, errAdd, 20000);
-        appendLog(outAdd + "\n" + errAdd);
-        if (!okAdd) {
-            appendLog("git add failed.");
-            QMessageBox::warning(this, "Add failed", errAdd);
-            return;
-        }
-        appendLog("Committing...");
-        QString outCi, errCi;
-        bool okCi = runCommand("git", {"-C", localPath, "commit", "-m", msg}, outCi, errCi, 20000);
-        appendLog(outCi + "\n" + errCi);
-        if (!okCi) {
-            // if there's nothing to commit maybe commit failed
-            if (errCi.contains("nothing to commit")) {
-                appendLog("Nothing to commit after add — aborting.");
-                QMessageBox::information(this, "Nothing to commit", "No changes to commit.");
-                return;
-            }
-            QMessageBox::warning(this, "Commit failed", errCi);
-            return;
-        }
-        appendLog("Pushing to remote...");
-        QString outPush, errPush;
-        bool okPush = runCommand("git", {"-C", localPath, "push"}, outPush, errPush, 60000);
-        appendLog(outPush + "\n" + errPush);
-        if (!okPush) {
-            appendLog("git push failed: " + errPush);
-            QMessageBox::warning(this, "Push failed", errPush);
-            return;
-        }
-        QMessageBox::information(this, "Success", "Committed and pushed changes.");
+        bool ok;
+        QString msg = QInputDialog::getText(this,"Commit message","Message:",QLineEdit::Normal,"Update",&ok);
+        if(!ok) return;
+
+        runCommand("git", {"-C", p, "add", "-A"}, out, err);
+        runCommand("git", {"-C", p, "commit", "-m", msg}, out, err);
+        runCommand("git", {"-C", p, "push"}, out, err);
+        QMessageBox::information(this,"Pushed",out+err);
         onRefreshLocal();
     }
 };
+
+
 
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
     GitHubClient w;
-    w.setWindowTitle("Qt GitHub Client (demo)");
-    w.resize(1100, 700);
+    w.resize(1100,700);
+    w.setWindowTitle("Qt GitHub Client REST API");
     w.show();
     return app.exec();
 }
-
 #include "main.moc"
